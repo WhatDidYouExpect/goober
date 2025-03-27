@@ -7,6 +7,7 @@ from nltk.tokenize import word_tokenize
 import random
 import os
 import time
+import asyncio
 import re
 import os
 import warnings
@@ -23,13 +24,34 @@ from config import *
 import traceback
 import shutil
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
+if platform.system() == 'Darwin':
+    try:
+        import metal
+        device = metal.MTLCreateSystemDefaultDevice()
+        if device:
+            print(f"{GREEN}Metal is supported on this mac, Attemping to use tensorflow-metal.{RESET}")
+            import tensorflow-metal as tfmetal
+            tf.config.set_visible_devices([], 'GPU')
+            physical_devices = tf.config.list_physical_devices('GPU')
+            if physical_devices:
+                tf.config.experimental.set_memory_growth(physical_devices[0], True)
+        else:
+            print(f"{YELLOW}Metal not supported on this mac. Using regular TensorFlow.{RESET}")
+    except ImportError:
+        print(f"{YELLOW}tensorflow-metal not available. using regular TensorFlow.{RESET}")
+else:
+    print(f"{DEBUG}Not running on macOS. using regular TensorFlow.{RESET}")
+
 import tensorflow as tf
 import numpy as np
 from tensorflow import keras
 Tokenizer = keras.preprocessing.text.Tokenizer
 pad_sequences = keras.preprocessing.sequence.pad_sequences
 Sequential = keras.models.Sequential
-Embedding, LSTM, Dense = keras.layers.Embedding, keras.layers.LSTM, keras.layers.Dense
+Embedding, LSTM, Dense, Dropout, Bidirectional = (
+    keras.layers.Embedding, keras.layers.LSTM, keras.layers.Dense, keras.layers.Dropout, keras.layers.Bidirectional
+)
+
 tf.get_logger().setLevel('ERROR') 
 
 analyzer = SentimentIntensityAnalyzer()
@@ -131,22 +153,30 @@ def register_name(NAME):
 register_name(NAME)
 
 class TextGenerator:
-    def __init__(self):
+    def __init__(self, vocab_size=5000, max_sequence_len=20):
+        self.tokenizer = Tokenizer(num_words=vocab_size, lower=True, oov_token="<OOV>")
+        self.max_sequence_len = max_sequence_len
+        self.vocab_size = vocab_size
         self.model = None
-        self.tokenizer = Tokenizer()
-        self.max_sequence_len = 20
-        self.vocab_size = 10000
-        
+    
     def build_model(self):
         model = Sequential([
-            Embedding(self.vocab_size, 64, input_length=self.max_sequence_len-1),
-            LSTM(128),
+            Embedding(self.vocab_size, 128, input_length=self.max_sequence_len - 1),
+            Bidirectional(LSTM(256, return_sequences=True)),
+            Dropout(0.2),
+            LSTM(256),
+            Dense(128, activation='relu'),
+            Dropout(0.2),
             Dense(self.vocab_size, activation='softmax')
         ])
-        model.compile(loss='categorical_crossentropy', optimizer='adam')
+        model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
         return model
     
-    def train(self, texts):
+    def preprocess_text(self, texts):
+        return [text.lower().strip() for text in texts]
+    
+    def train(self, texts, epochs=20, batch_size=64):
+        texts = self.preprocess_text(texts)
         self.tokenizer.fit_on_texts(texts)
         sequences = self.tokenizer.texts_to_sequences(texts)
         input_sequences = []
@@ -155,72 +185,59 @@ class TextGenerator:
                 input_sequences.append(sequence[:i+1])
         
         input_sequences = pad_sequences(input_sequences, maxlen=self.max_sequence_len, padding='pre')
-        
-        X = input_sequences[:, :-1]
-        y = input_sequences[:, -1]
-        y = tf.keras.utils.to_categorical(y, num_classes=self.vocab_size)
+        X, y = input_sequences[:, :-1], input_sequences[:, -1]
         
         self.model = self.build_model()
-        self.model.fit(X, y, batch_size=64, epochs=10, verbose=1, shuffle=True)
-
-        try:
-            save_path = os.path.abspath('text_generator.pkl')
-            with open(save_path, 'wb') as f:
-                pickle.dump({
-                    'tokenizer': self.tokenizer,
-                    'model_weights': self.model.get_weights(),
-                    'model_config': self.model.get_config(),
-                    'max_sequence_len': self.max_sequence_len,
-                    'vocab_size': self.vocab_size
-                }, f)
-            print(f"{GREEN}Model successfully saved to {save_path}{RESET}")
-        except Exception as e:
-            print(f"{RED}Failed to save model: {e}{RESET}")
-            traceback.print_exc()
+        self.model.fit(X, y, batch_size=batch_size, epochs=epochs, verbose=1, shuffle=True)
         
-        return self 
+        self.model.save('text_generator.h5')
+        with open('tokenizer.pkl', 'wb') as f:
+            pickle.dump(self.tokenizer, f)
     
-    def generate_text(self, seed_text, num_words=10):
-        if not self.model:
-            return None
-            
-        for _ in range(num_words):
-            token_list = self.tokenizer.texts_to_sequences([seed_text])[0]
-            token_list = pad_sequences([token_list], maxlen=self.max_sequence_len-1, padding='pre')
-            predicted = np.argmax(self.model.predict(token_list), axis=-1)
-            
-            output_word = ""
-            for word, index in self.tokenizer.word_index.items():
-                if index == predicted:
-                    output_word = word
-                    break
-            seed_text += " " + output_word
-        return seed_text
-
+    def load(self):
+        if os.path.exists('text_generator.h5') and os.path.exists('tokenizer.pkl'):
+            self.model = load_model('text_generator.h5')
+            with open('tokenizer.pkl', 'rb') as f:
+                self.tokenizer = pickle.load(f)
+        else:
+            raise FileNotFoundError("Model or tokenizer file not found")
+    
+    def generate_text(self, seed_text, max_len=20):
+        token_list = self.tokenizer.texts_to_sequences([seed_text])
+        if not token_list or not token_list[0]:
+            return seed_text
+        
+        token_list = pad_sequences(token_list, maxlen=self.max_sequence_len-1)
+        
+        generated_text = seed_text
+        for _ in range(max_len):
+            preds = self.model.predict(token_list, verbose=0)
+            next_word = np.argmax(preds, axis=-1)[0]
+            word = self.tokenizer.index_word.get(next_word, "")
+            if word == "":
+                break
+            generated_text += " " + word
+            token_list = np.append(token_list[:, 1:], [[next_word]], axis=1)
+        
+        return generated_text
+        
 text_generator = TextGenerator()
 
-def save_model(generator, filename='text_generator.pkl'):
-    with open(filename, 'wb') as f:
-        pickle.dump({
-            'tokenizer': generator.tokenizer,
-            'max_sequence_len': generator.max_sequence_len,
-            'vocab_size': generator.vocab_size
-        }, f)
-    print(f"Model saved to {filename}.")
+async def run_model_in_executor(func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+def save_model(self):
+    self.model.save('text_generator.h5')
+    with open('tokenizer.pkl', 'wb') as f:
+        pickle.dump(self.tokenizer, f)
 
 def load_model(filename='text_generator.pkl'):
     try:
         with open(filename, 'rb') as f:
-            data = pickle.load(f)
-            generator = TextGenerator()
-            generator.tokenizer = data['tokenizer']
-            generator.max_sequence_len = data['max_sequence_len']
-            generator.vocab_size = data['vocab_size']
-            generator.model = generator.build_model()
-        print(f"{GREEN}Model loaded from {filename}.{RESET}")
-        return generator
+            return pickle.load(f)
     except FileNotFoundError:
-        print(f"{RED}{filename} not found retraining..\n goober will seem to freeze but wait a hot mintue for tensorflow to kick in.{RESET}")
+        print("Model file not found, retraining required.")
         return None
 
 def get_latest_version_info():
@@ -252,7 +269,7 @@ latest_version = "0.0.0"
 local_version = "tensorflow"
 
 def check_for_update():
-    print(f"{YELLOW}This verion of goober doesnt have an update system!{RESET}")
+    print(f"goober Tensorflow edition")
 check_for_update()
 
 def get_file_info(file_path):
@@ -443,24 +460,44 @@ async def retrain(ctx):
 
 @bot.hybrid_command(description=f"{get_translation(LOCALE, 'command_desc_talk')}")
 async def talk(ctx, sentence_size: int = 5):
+    print("Running text generation")
     if not text_generator:
         await send_message(ctx, f"{get_translation(LOCALE, 'command_talk_insufficent_text')}")
         return
-
-    seed_text = random.choice(list(text_generator.tokenizer.word_index.keys()))
-    response = text_generator.generate_text(seed_text, sentence_size)
-
-    if response:
-        cleaned_response = re.sub(r'[^\w\s]', '', response).lower()
+    if sentence_size < 1 or sentence_size > 1000:  # Set reasonable limits
+        await send_message(ctx, f"{get_translation(LOCALE, 'command_talk_invalid_length')}")
+        return
+    try:
+        vocab = list(text_generator.tokenizer.word_index.keys())
+        if not vocab:
+            await send_message(ctx, f"{get_translation(LOCALE, 'command_talk_no_vocab')}")
+            return
+            
+        seed_text = random.choice(vocab)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: text_generator.generate_text(seed_text, sentence_size)
+        )
+        if not response:
+            await send_message(ctx, f"{get_translation(LOCALE, 'command_talk_generation_fail')}")
+            return
+        cleaned_response = re.sub(r'[^\w\s]', '', response).lower().strip()
+        if not cleaned_response:  # Check for empty response after cleaning
+            await send_message(ctx, f"{get_translation(LOCALE, 'command_talk_empty_response')}")
+            return
         coherent_response = rephrase_for_coherence(cleaned_response)
         if random.random() < 0.9 and is_positive(coherent_response):
             gif_url = random.choice(positive_gifs)
-            combined_message = f"{coherent_response}\n[jif]({gif_url})"
+            final_message = f"{coherent_response}\n[jif]({gif_url})"
         else:
-            combined_message = coherent_response
-        await send_message(ctx, combined_message)
-    else:
-        await send_message(ctx, f"{get_translation(LOCALE, 'command_talk_generation_fail')}")
+            final_message = coherent_response
+        await send_message(ctx, final_message[:2000])
+
+    except Exception as e:
+        print(f"{RED}Error in talk command: {e}{RESET}")
+        traceback.print_exc()
+        await send_message(ctx, f"{get_translation(LOCALE, 'command_error')}")
 
 @bot.hybrid_command(description=f"{get_translation(LOCALE, 'command_desc_ask')}")
 async def ask(ctx, *, prompt: str):
