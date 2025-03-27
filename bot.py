@@ -2,7 +2,6 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import json
-import markovify
 import nltk
 from nltk.tokenize import word_tokenize
 import random
@@ -10,6 +9,9 @@ import os
 import time
 import re
 import os
+import warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+warnings.filterwarnings('ignore')
 import requests
 import platform
 import subprocess
@@ -21,6 +23,14 @@ from config import *
 import traceback
 import shutil
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
+import tensorflow as tf
+import numpy as np
+from tensorflow import keras
+Tokenizer = keras.preprocessing.text.Tokenizer
+pad_sequences = keras.preprocessing.sequence.pad_sequences
+Sequential = keras.models.Sequential
+Embedding, LSTM, Dense = keras.layers.Embedding, keras.layers.LSTM, keras.layers.Dense
+tf.get_logger().setLevel('ERROR') 
 
 analyzer = SentimentIntensityAnalyzer()
 
@@ -120,35 +130,101 @@ def register_name(NAME):
 
 register_name(NAME)
 
-def save_markov_model(model, filename='markov_model.pkl'):
+class TextGenerator:
+    def __init__(self):
+        self.model = None
+        self.tokenizer = Tokenizer()
+        self.max_sequence_len = 20
+        self.vocab_size = 10000
+        
+    def build_model(self):
+        model = Sequential([
+            Embedding(self.vocab_size, 64, input_length=self.max_sequence_len-1),
+            LSTM(128),
+            Dense(self.vocab_size, activation='softmax')
+        ])
+        model.compile(loss='categorical_crossentropy', optimizer='adam')
+        return model
+    
+    def train(self, texts):
+        self.tokenizer.fit_on_texts(texts)
+        sequences = self.tokenizer.texts_to_sequences(texts)
+        input_sequences = []
+        for sequence in sequences:
+            for i in range(1, len(sequence)):
+                input_sequences.append(sequence[:i+1])
+        
+        input_sequences = pad_sequences(input_sequences, maxlen=self.max_sequence_len, padding='pre')
+        
+        X = input_sequences[:, :-1]
+        y = input_sequences[:, -1]
+        y = tf.keras.utils.to_categorical(y, num_classes=self.vocab_size)
+        
+        self.model = self.build_model()
+        self.model.fit(X, y, batch_size=64, epochs=10, verbose=1, shuffle=True)
+
+        try:
+            save_path = os.path.abspath('text_generator.pkl')
+            with open(save_path, 'wb') as f:
+                pickle.dump({
+                    'tokenizer': self.tokenizer,
+                    'model_weights': self.model.get_weights(),
+                    'model_config': self.model.get_config(),
+                    'max_sequence_len': self.max_sequence_len,
+                    'vocab_size': self.vocab_size
+                }, f)
+            print(f"{GREEN}Model successfully saved to {save_path}{RESET}")
+        except Exception as e:
+            print(f"{RED}Failed to save model: {e}{RESET}")
+            traceback.print_exc()
+        
+        return self 
+    
+    def generate_text(self, seed_text, num_words=10):
+        if not self.model:
+            return None
+            
+        for _ in range(num_words):
+            token_list = self.tokenizer.texts_to_sequences([seed_text])[0]
+            token_list = pad_sequences([token_list], maxlen=self.max_sequence_len-1, padding='pre')
+            predicted = np.argmax(self.model.predict(token_list), axis=-1)
+            
+            output_word = ""
+            for word, index in self.tokenizer.word_index.items():
+                if index == predicted:
+                    output_word = word
+                    break
+            seed_text += " " + output_word
+        return seed_text
+
+text_generator = TextGenerator()
+
+def save_model(generator, filename='text_generator.pkl'):
     with open(filename, 'wb') as f:
-        pickle.dump(model, f)
-    print(f"Markov model saved to {filename}.")
+        pickle.dump({
+            'tokenizer': generator.tokenizer,
+            'max_sequence_len': generator.max_sequence_len,
+            'vocab_size': generator.vocab_size
+        }, f)
+    print(f"Model saved to {filename}.")
 
-def load_markov_model(filename='markov_model.pkl'):
-
+def load_model(filename='text_generator.pkl'):
     try:
         with open(filename, 'rb') as f:
-            model = pickle.load(f)
-        print(f"{GREEN}{get_translation(LOCALE, 'model_loaded')} {filename}.{RESET}")
-        return model
+            data = pickle.load(f)
+            generator = TextGenerator()
+            generator.tokenizer = data['tokenizer']
+            generator.max_sequence_len = data['max_sequence_len']
+            generator.vocab_size = data['vocab_size']
+            generator.model = generator.build_model()
+        print(f"{GREEN}Model loaded from {filename}.{RESET}")
+        return generator
     except FileNotFoundError:
-        print(f"{RED}{filename} {get_translation(LOCALE, 'not_found')}{RESET}")
+        print(f"{RED}{filename} not found retraining..\n goober will seem to freeze but wait a hot mintue for tensorflow to kick in.{RESET}")
         return None
 
 def get_latest_version_info():
-
-    try:
-
-        response = requests.get(UPDATE_URL, timeout=5)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"{RED}{get_translation(LOCALE, 'version_error')} {response.status_code}{RESET}")
-            return None
-    except requests.RequestException as e:
-        print(f"{RED}{get_translation(LOCALE, 'version_error')} {e}{RESET}")
-        return None
+    return "Not Avaliable"
     
 async def load_cogs_from_folder(bot, folder_name="cogs"):
     for filename in os.listdir(folder_name):
@@ -173,43 +249,10 @@ def generate_sha256_of_current_file():
 
 
 latest_version = "0.0.0"
-local_version = "0.14.8.1"
+local_version = "tensorflow"
 
 def check_for_update():
-    if ALIVEPING == "false":
-        return
-    global latest_version, local_version 
-    
-    latest_version_info = get_latest_version_info()
-    if not latest_version_info:
-        print(f"{get_translation(LOCALE, 'fetch_update_fail')}")
-        return None, None 
-
-    latest_version = latest_version_info.get("version")
-    download_url = latest_version_info.get("download_url")
-
-    if not latest_version or not download_url:
-        print(f"{RED}{get_translation(LOCALE, 'invalid_server')}{RESET}")
-        return None, None 
-
-    if local_version == "0.0.0":
-        with open(LOCAL_VERSION_FILE, "w") as f:
-            f.write(latest_version)
-    generate_sha256_of_current_file()
-    gooberhash = latest_version_info.get("hash")
-    if gooberhash == currenthash:
-        if local_version < latest_version:
-            print(f"{YELLOW}{get_translation(LOCALE, 'new_version').format(latest_version=latest_version, local_version=local_version)}{RESET}")
-            print(f"{YELLOW}{get_translation(LOCALE, 'changelog').format(VERSION_URL=VERSION_URL)}{RESET}")
-        else:
-            print(f"{GREEN}{get_translation(LOCALE, 'latest_version')} {local_version}{RESET}")
-            print(f"{get_translation(LOCALE, 'latest_version2').format(VERSION_URL=VERSION_URL)}\n\n")
-    else:
-        print(f"{YELLOW}{get_translation(LOCALE, 'modification_warning')}")
-        print(f"{YELLOW}{get_translation(LOCALE, 'reported_version')} {local_version}{RESET}")
-        print(f"{DEBUG}{get_translation(LOCALE, 'current_hash')} {currenthash}{RESET}")
-
-
+    print(f"{YELLOW}This verion of goober doesnt have an update system!{RESET}")
 check_for_update()
 
 def get_file_info(file_path):
@@ -248,14 +291,16 @@ def save_memory(memory):
     with open(MEMORY_FILE, "w") as f:
         json.dump(memory, f, indent=4)
 
-def train_markov_model(memory, additional_data=None):
+def train_text_generator(memory, additional_data=None):
     if not memory:
         return None
     text = "\n".join(memory)
     if additional_data:
         text += "\n" + "\n".join(additional_data)
-    model = markovify.NewlineText(text, state_size=2)
-    return model
+    generator = TextGenerator()
+    generator.train(text.split('\n'))
+    return generator
+
 #this doesnt work and im extremely pissed and mad
 def append_mentions_to_18digit_integer(message):
     pattern = r'\b\d{18}\b'
@@ -274,11 +319,11 @@ intents.messages = True
 intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 memory = load_memory() 
-markov_model = load_markov_model()
-if not markov_model:
+text_generator = load_model()
+if not text_generator:
     print(f"{get_translation(LOCALE, 'no_model')}")
     memory = load_memory()
-    markov_model = train_markov_model(memory)
+    text_generator = train_text_generator(memory)
 
 generated_sentences = set()
 used_words = set()
@@ -293,7 +338,7 @@ async def on_ready():
         print(f"{GREEN}{get_translation(LOCALE, 'folder_created').format(folder_name=folder_name)}{RESET}")
     else:
        print(f"{DEBUG}{get_translation(LOCALE, 'folder_exists').format(folder_name=folder_name)}{RESET}")
-    markov_model = train_markov_model(memory)
+    text_generator = load_model()
     await load_cogs_from_folder(bot)
     global slash_commands_enabled
     print(f"{GREEN}{get_translation(LOCALE, 'logged_in')} {bot.user}{RESET}")
@@ -389,42 +434,21 @@ async def retrain(ctx):
     except json.JSONDecodeError:
         await send_message(ctx, f"{get_translation(LOCALE, 'command_markov_memory_is_corrupt')}")
         return
-    data_size = len(memory)
-    processed_data = 0
-    processing_message_ref = await send_message(ctx, f"{get_translation(LOCALE, 'command_markov_retraining').format(processed_data=processed_data, data_size=data_size)}")
-    start_time = time.time()
-    for i, data in enumerate(memory):
-        processed_data += 1
-        if processed_data % 1000 == 0 or processed_data == data_size:
-            await send_message(ctx, f"{get_translation(LOCALE, 'command_markov_retraining').format(processed_data=processed_data, data_size=data_size)}", edit=True, message_reference=processing_message_ref)
 
-    global markov_model
-    
-    markov_model = train_markov_model(memory)
-    save_markov_model(markov_model)
+    global text_generator
+    text_generator = train_text_generator(memory)
+    save_model(text_generator)
 
-    await send_message(ctx, f"{get_translation(LOCALE, 'command_markov_retrain_successful').format(data_size=data_size)}", edit=True, message_reference=processing_message_ref)
+    await send_message(ctx, f"{get_translation(LOCALE, 'command_markov_retrain_successful').format(data_size=len(memory))}")
 
 @bot.hybrid_command(description=f"{get_translation(LOCALE, 'command_desc_talk')}")
 async def talk(ctx, sentence_size: int = 5):
-    if not markov_model:
+    if not text_generator:
         await send_message(ctx, f"{get_translation(LOCALE, 'command_talk_insufficent_text')}")
         return
 
-    response = None
-    for _ in range(20):
-        if sentence_size == 1:
-            response = markov_model.make_short_sentence(max_chars=100, tries=100)
-            if response:
-                response = response.split()[0]
-        else:
-            response = markov_model.make_sentence(tries=100, max_words=sentence_size)
-
-        if response and response not in generated_sentences:
-            if sentence_size > 1:
-                response = improve_sentence_coherence(response)
-            generated_sentences.add(response)
-            break
+    seed_text = random.choice(list(text_generator.tokenizer.word_index.keys()))
+    response = text_generator.generate_text(seed_text, sentence_size)
 
     if response:
         cleaned_response = re.sub(r'[^\w\s]', '', response).lower()
@@ -437,6 +461,30 @@ async def talk(ctx, sentence_size: int = 5):
         await send_message(ctx, combined_message)
     else:
         await send_message(ctx, f"{get_translation(LOCALE, 'command_talk_generation_fail')}")
+
+@bot.hybrid_command(description=f"{get_translation(LOCALE, 'command_desc_ask')}")
+async def ask(ctx, *, prompt: str):
+    if not text_generator:
+        await send_message(ctx, f"{get_translation(LOCALE, 'command_ask_insufficient_text')}")
+        return
+
+    response = text_generator.generate_text(prompt, 10)
+
+    if response:
+        cleaned_response = re.sub(r'[^\w\s]', '', response).lower()
+        coherent_response = rephrase_for_coherence(cleaned_response)
+        
+        if random.random() < 0.9 and is_positive(coherent_response):
+            gif_url = random.choice(positive_gifs)
+            combined_message = f"{coherent_response}\n[jif]({gif_url})"
+        else:
+            combined_message = coherent_response
+
+        await send_message(ctx, combined_message)
+    else:
+        await send_message(ctx, f"{get_translation(LOCALE, 'command_ask_generation_fail')}")
+
+
 
 def improve_sentence_coherence(sentence):
 
